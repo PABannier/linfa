@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["PlsError",""]],"struct":[["PlsCanonical",""],["PlsCanonicalParams",""],["PlsCanonicalValidParams",""],["PlsCca",""],["PlsCcaParams",""],["PlsCcaValidParams",""],["PlsRegression",""],["PlsRegressionParams",""],["PlsRegressionValidParams",""],["PlsSvd",""],["PlsSvdParams",""]],"type":[["Result",""]]});

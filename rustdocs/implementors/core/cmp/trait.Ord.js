@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["linfa_clustering"] = [{"text":"impl&lt;F:&nbsp;<a class=\"trait\" href=\"linfa/dataset/trait.Float.html\" title=\"trait linfa::dataset::Float\">Float</a>&gt; <a class=\"trait\" href=\"https://doc.rust-lang.org/1.57.0/core/cmp/trait.Ord.html\" title=\"trait core::cmp::Ord\">Ord</a> for <a class=\"struct\" href=\"linfa_clustering/struct.Sample.html\" title=\"struct linfa_clustering::Sample\">Sample</a>&lt;F&gt;","synthetic":false,"types":["linfa_clustering::optics::algorithm::Sample"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
