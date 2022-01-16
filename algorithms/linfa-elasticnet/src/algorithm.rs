@@ -1,5 +1,7 @@
 use approx::{abs_diff_eq, abs_diff_ne};
-use ndarray::{s, Array1, ArrayBase, ArrayView1, ArrayView2, Axis, CowArray, Data, Ix1, Ix2};
+use ndarray::{
+    s, Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Axis, CowArray, Data, Ix1, Ix2,
+};
 use ndarray_linalg::{Inverse, Lapack};
 
 use linfa::traits::{Fit, PredictInplace};
@@ -185,6 +187,181 @@ fn coordinate_descent<'a, F: Float>(
         }
     }
     (w, gap, n_steps)
+}
+
+fn primal_enet<'a, F: Float>(
+    r: ArrayView1<'a, F>,
+    w: ArrayView1<'a, F>,
+    penalty: F,
+    l1_ratio: F,
+) -> F {
+    let datafit = r.dot(&r) / F::cast(2 * r.len());
+    let l1_reg = l1_ratio * penalty * w.map(|&wj| wj.abs()).sum();
+    let l2_reg = (F::one() - l1_ratio) * penalty * w.dot(&w);
+    datafit + l1_reg + l2_reg
+}
+
+fn cd_epoch<'a, F: Float>(
+    x: ArrayView2<'a, F>,
+    norm_cols_x: ArrayView1<'a, F>,
+    c: ArrayView1<'a, usize>,
+    r: &'a mut Array1<F>,
+    w: &'a mut Array1<F>,
+    penalty: F,
+    l1_ratio: F,
+    n_samples: usize,
+) {
+    for &j in c.iter() {
+        if abs_diff_eq!(norm_cols_x[j], F::zero()) {
+            continue;
+        }
+        let old_w_j = w[j];
+        w[j] += x.slice(s![.., j]).dot(r) / F::powi(norm_cols_x[j], 2);
+    }
+}
+
+fn set_prios<'a, F: Float>(
+    x: ArrayView2<'a, F>,
+    norm_cols_x: ArrayView1<'a, F>,
+    xt_theta: ArrayView1<'a, F>,
+    screened: &'a mut Array1<bool>,
+    prios: &'a mut Array1<F>,
+    radius: F,
+    mut n_screened: usize,
+) -> usize {
+    let n_features = x.shape()[1];
+    for j in 0..n_features {
+        if screened[j] || abs_diff_eq!(norm_cols_x[j], F::zero()) {
+            prios[j] = F::infinity();
+            continue;
+        }
+        prios[j] = (F::one() - xt_theta[j].abs()) / norm_cols_x[j]; // TODO: check if different with Elastic-Net (not sure of abs())
+        if prios[j] > radius {
+            screened[j] = true;
+            n_screened += 1;
+        }
+    }
+    n_screened
+}
+
+fn create_working_set<'a, F: Float>(
+    w: ArrayView1<'a, F>,
+    screened: ArrayView1<'a, bool>,
+    c: ArrayView1<'a, usize>,
+    prios: &'a mut Array1<F>,
+    p0: usize,
+    n_epoch: usize,
+    n_screened: usize,
+    previous_ws_size: usize,
+    prune: bool,
+) -> usize {
+    let n_features = w.len();
+    let mut ws_size;
+    if prune {
+        let mut nnz = 0;
+        for j in 0..n_features {
+            if abs_diff_ne!(w[j], F::zero()) {
+                prios[j] = -F::one();
+                nnz += 1;
+            }
+        }
+        if n_epoch == 0 {
+            ws_size = if nnz == 0 { p0 } else { nnz };
+        } else {
+            ws_size = 2 * nnz;
+        }
+    } else {
+        for j in 0..n_features {
+            if abs_diff_ne!(w[j], F::zero()) {
+                prios[j] = -F::one();
+            }
+        }
+        if n_epoch == 0 {
+            ws_size = p0;
+        } else {
+            for j in 0..previous_ws_size {
+                if !screened[c[j]] {
+                    prios[c[j]] = -F::one();
+                }
+            }
+            ws_size = 2 * previous_ws_size;
+        }
+    }
+    if ws_size > n_features - n_screened {
+        ws_size = n_features - n_screened;
+    }
+    ws_size
+}
+
+fn create_accel_primal_pt<'a, F: Float + Lapack>(
+    w: ArrayView1<F>,
+    out: &mut Array1<F>,
+    last_k_w: &mut Array2<F>,
+    u: &mut Array2<F>,
+    utu: &mut Array2<F>,
+    epoch: usize,
+    gap_freq: usize,
+    verbose: bool,
+) {
+    let k = u.shape()[0] + 1;
+    if epoch / gap_freq < k {
+        last_k_w.slice_mut(s![epoch / gap_freq, ..]).assign(&w);
+    } else {
+        for idx in 0..(k - 1) {
+            for j in 0..w.len() {
+                last_k_w[[idx, j]] = last_k_w[[idx + 1, j]];
+            }
+        }
+        last_k_w.slice_mut(s![k - 1, ..]).assign(&w);
+        for idx in 0..(k - 1) {
+            for j in 0..w.len() {
+                u[[idx, j]] = last_k_w[[idx + 1, j]] - last_k_w[[idx, j]];
+            }
+        }
+        // double for loop but small: K**2/2
+        for idx in 0..k - 1 {
+            for j in idx..k - 1 {
+                utu[[k, j]] = u.slice(s![k, ..]).dot(&u.slice(s![j, ..]));
+                utu[[j, k]] = utu[[k, j]];
+            }
+        }
+    }
+    let _anderson = utu.inv();
+    match _anderson {
+        Ok(_res) => {
+            let res = _res.map_axis(Axis(0), |col| col.sum());
+            let anderson = res.map(|&x| x / res.sum());
+            out.fill(F::zero());
+            for idx in 0..k - 1 {
+                for j in 0..w.len() {
+                    out[j] += anderson[idx] * last_k_w[[idx, j]];
+                }
+            }
+        }
+        Err(_) => {
+            if verbose {
+                println!("Singular matrix when computing accelerated point. Skipped.");
+            }
+        }
+    }
+}
+
+fn compute_residual<'a, F: Float>(
+    x: ArrayView2<'a, F>,
+    y: ArrayView1<'a, F>,
+    w: ArrayView1<'a, F>,
+) -> Array1<F> {
+    let mut r = y.to_owned();
+    let n_samples = x.shape()[0];
+    let n_features = x.shape()[1];
+    for j in 0..n_features {
+        if abs_diff_ne!(w[j], F::zero()) {
+            for i in 0..n_samples {
+                r[i] -= w[j] * x[[i, j]];
+            }
+        }
+    }
+    r
 }
 
 fn duality_gap<'a, F: Float>(
