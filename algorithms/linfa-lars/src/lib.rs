@@ -20,14 +20,14 @@ use ndarray_linalg::{
 };
 use num_traits::Float;
 
-fn lars<F: 'static + Float + Lapack + Ord>(
-    x: ArrayView2<F>,
-    y: ArrayView1<F>,
+fn lars<'a, F: 'static + Float + Lapack + Ord>(
+    x: ArrayView2<'a, F>,
+    y: ArrayView1<'a, F>,
     max_iterations: usize,
     alpha_min: F,
     eps: F,
     verbose: bool,
-) {
+) -> (ArrayView1<'a, F>, Vec<usize>, ArrayView2<'a, F>){
     // Define input
     let n_samples = x.shape()[0];
     let n_features = x.shape()[1];
@@ -154,43 +154,42 @@ fn lars<F: 'static + Float + Lapack + Ord>(
                 .solvec(&sign_active_restricted)
                 .expect("Cholesky matrix is not singular");
 
-            let mut AA;
+            let mut aa;
             if least_squares.len() == 1 && least_squares[0] == F::zero() {
                 // this happens because sign_active[:n_active] = 0
-                least_squares[0] = 1;
-                AA = F::one();
+                least_squares[0] = F::one();
+                aa = F::one();
             } else {
-                AA = F::one() / F::sqrt(F::sum(????)));
-
-                if !F::is_finite(AA) {
+                aa = F::one() / <F as Float>::sqrt(<F as Float>::sum(????)));
+                if !F::is_finite(aa) {
                     // L is too ill-conditioned
                     let i = 0;
                     let cholesky_lower_ = cholesky_lower.slice(s![..n_active, ..n_active]).to_owned();
-                    while F::is_infinite() {
+                    while !F::is_finite(aa) {
                         ??????
                     }
                 }
-                least_squares *= AA;
+                let least_squares = least_squares.map(|&x| x * aa);
             }
 
             // very time-consuming; could be enhanced by taking the QR decomposition of x
             let corr_eq_dir = gram.slice(s![..n_active, n_active..]).t().dot(&least_squares);
 
             // avoid unstable results because of rounding errors
-            let corr_eq_dir = F::trunc(corr_eq_dir * 1e8) / 1e8;
+            let corr_eq_dir = F::trunc(corr_eq_dir * 1e8) / F::from(1e8).unwrap();
             
             let g1 = F::infinity();
             for j in 0..n_features {
-                let tmp = (largest_cov - cov[j]) / (AA - corr_eq_dir + F::epsilon());
-                let g1 = if g1 > tmp && tmp >= 0 { tmp } else { g1 };  
+                let tmp = (largest_cov - cov[j]) / (aa - corr_eq_dir + F::epsilon());
+                let g1 = if g1 > tmp && tmp >= F::zero() { tmp } else { g1 };  
             }
 
             let g2 = F::infinity();
             for j in 0..n_features {
-                let tmp = (largest_cov + cov[j]) / (AA + corr_eq_dir + F::epsilon());
-                let g2 = if g2 > tmp && tmp >= 0 { tmp } else { g2 };
+                let tmp = (largest_cov + cov[j]) / (aa + corr_eq_dir + F::epsilon());
+                let g2 = if g2 > tmp && tmp >= F::zero() { tmp } else { g2 };
             }
-            let gamma_ = F::min(g1, F::min(g2, largest_cov / AA));
+            let gamma_ = <F as Float>::min(g1, <F as Float>::min(g2, largest_cov / aa));
 
             drop = false;
             // TODO!!!
@@ -198,9 +197,48 @@ fn lars<F: 'static + Float + Lapack + Ord>(
             // z_pos = arrayfuncs.min_pos(z)
             if z_pos < gamma_ {
                 // some coefficients have changed sign
+                // TODO!!
+            }
+
+            n_iter += 1;
+
+            if n_iter >= coefficients.shape()[0] {
+                std::mem::drop(coef);
+                std::mem::drop(alpha);
+                std::mem::drop(prev_alpha);
+                std::mem::drop(prev_coef);
+                // resize the coefficients and alphas arrays
+                let add_features = 2 * usize::max(1, max_features - n_active);
+                let coefficients = coefficients.into_shape((n_iter + add_features, n_features))
+                                               .expect("coefficients have the correct shape");
+                for i in add_features..n_iter + add_features {
+                    for j in 0..n_features {
+                        coefficients[[i, j]] = F::zero();
+                    }
+                }
+                let alphas = alphas.into_shape(n_iter + add_features)
+                                   .expect("alphas have the correct shape");
+                for i in add_features..n_iter + add_features {
+                    alphas[i] = F::zero();
+                }
+            }
+            let coef = coefficients.slice(s![n_iter, ..]);
+            let prev_coef = coefficients.slice(s![n_iter - 1, ..]);
+
+            // Making a forward step
+            for j in active {
+                coef[j] = prev_coef[j] + gamma_ * least_squares[j];
+            }
+
+            // Update correlations
+            for j in 0..n_features {
+                cov[j] -= gamma_ * corr_eq_dir;
             }
         }
-    }
+    // Resize coefficients in case of early stopping
+    let alphas = alphas.slice(s![..n_iter + 1]);
+    let coefficients = coefficients.slice(s![..n_iter + 1, ..]);
+    (alphas, active, coefficients.t())
 }
 
 fn swap_elements<F, I>(x: &mut ArrayBase<OwnedRepr<F>, I>, perm: (usize, usize), axis: usize)
