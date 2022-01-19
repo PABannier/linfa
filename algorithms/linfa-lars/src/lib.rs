@@ -9,7 +9,6 @@
 extern crate ndarray;
 
 use ndarray::linalg::general_mat_mul;
-use std::ops::Mul;
 use ndarray::{
     s, Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Axis, Dimension, OwnedRepr, RemoveAxis,
 };
@@ -20,6 +19,7 @@ use ndarray_linalg::{
     Lapack,
 };
 use num_traits::Float;
+use std::ops::Mul;
 
 fn lars<'a, F: 'static + Float + Lapack + Ord>(
     x: ArrayView2<'a, F>,
@@ -28,7 +28,7 @@ fn lars<'a, F: 'static + Float + Lapack + Ord>(
     alpha_min: F,
     eps: F,
     verbose: bool,
-) -> (ArrayView1<'a, F>, &'a Vec<usize>, ArrayView2<'a, F>){
+) -> (Array1<F>, Vec<usize>, Array2<F>) {
     // Define input
     let n_samples = x.shape()[0];
     let n_features = x.shape()[1];
@@ -69,27 +69,28 @@ fn lars<'a, F: 'static + Float + Lapack + Ord>(
 
         let largest_cov = cov[c_idx];
 
-        let mut alpha = Array1::from_shape_vec(1, vec![&alphas[n_iter]]).unwrap();
+        let mut alpha = alphas[n_iter];
+        let prev_alpha = alphas[n_iter - 1];
+
         let mut coef = coefficients.slice(s![n_iter, ..]).to_owned();
-        let prev_alpha = Array1::from_shape_vec(1, vec![alphas[n_iter - 1]]).unwrap();
         let prev_coef = coefficients.slice(s![n_iter - 1, ..]);
 
-        alpha[0] = &(largest_abs_cov / F::from(n_samples).unwrap());
+        alpha = largest_abs_cov / F::from(n_samples).unwrap();
         // early stopping
-        if alpha[0] <= &(alpha_min + F::epsilon()) {
-            if <F as Float>::abs(*alpha[0] - alpha_min) > F::epsilon() {
+        if alpha <= alpha_min + F::epsilon() {
+            if <F as Float>::abs(alpha - alpha_min) > F::epsilon() {
                 // interpolation factor 0 <= ss < 1
                 if n_iter > 0 {
                     // in the first iteration, all alphas are zero, the formula below
                     // would make ss a NaN
                     // ss is the scaling factor to make equivariant
-                    let ss = (prev_alpha[0] - alpha_min) / (prev_alpha[0] - *alpha[0]);
+                    let ss = (prev_alpha - alpha_min) / (prev_alpha - alpha);
                     // one step in the direction of the x_j feature
                     for j in 0..n_features {
                         coef[j] = prev_coef[j] + ss * (coef[j] - prev_coef[j]);
                     }
                 }
-                alpha[0] = &alpha_min;
+                alpha = alpha_min;
                 coefficients.slice_mut(s![n_iter, ..]).assign(&coef);
                 break;
             }
@@ -104,7 +105,7 @@ fn lars<'a, F: 'static + Float + Lapack + Ord>(
 
             swap_elements(&mut cov, (0, c_idx), 0);
             swap_elements(&mut indices, (m, n), 0);
-            let cov = cov.slice(s![1..]); // remove cov[0]
+            let mut cov = cov.slice(s![1..]).to_owned(); // remove cov[0]
 
             swap_elements(&mut gram, (m, n), 0);
             swap_elements(&mut gram, (m, n), 1);
@@ -122,6 +123,9 @@ fn lars<'a, F: 'static + Float + Lapack + Ord>(
                     .slice(s![..n_active, ..n_active])
                     .solve_triangular(UPLO::Lower, Diag::NonUnit, &b)
                     .expect("Cholesky matrix is non-singular");
+                cholesky_lower
+                    .slice_mut(s![n_active, ..n_active])
+                    .assign(&_res);
             }
 
             let v = cholesky_lower
@@ -156,9 +160,10 @@ fn lars<'a, F: 'static + Float + Lapack + Ord>(
                 least_squares[0] = F::one();
                 aa = F::one();
             } else {
-                aa = F::one() / <F as Float>::sqrt(
-                    least_squares.mul(sign_active.slice(s![..n_active])).sum()
-                );
+                aa = F::one()
+                    / <F as Float>::sqrt(
+                        least_squares.mul(sign_active.slice(s![..n_active])).sum(),
+                    );
                 // if !F::is_finite(aa) {
                 //     // L is too ill-conditioned
                 //     let i = 0;
@@ -176,25 +181,37 @@ fn lars<'a, F: 'static + Float + Lapack + Ord>(
                 //         i += 1;
                 //     }
                 // }
-                let least_squares = least_squares.map(|&x| x * aa);
+                for j in 0..n_active {
+                    least_squares[j] *= aa;
+                }
             }
 
             // very time-consuming; could be enhanced by taking the QR decomposition of x
-            let corr_eq_dir = gram.slice(s![..n_active, n_active..]).t().dot(&least_squares);
+            let corr_eq_dir = gram
+                .slice(s![..n_active, n_active..])
+                .t()
+                .dot(&least_squares); // shape: (n_features - n_active,)
 
             // avoid unstable results because of rounding errors
-            let corr_eq_dir = corr_eq_dir.map(|&x| F::trunc(x * F::from(1e8).unwrap()) / F::from(1e8).unwrap());
+            // let corr_eq_dir =
+            //     corr_eq_dir.map(|&x| F::trunc(x * F::from(1e8).unwrap()) / F::from(1e8).unwrap());
 
-            let g1 = F::infinity();
+            // min-pos
+            let mut g1 = F::infinity();
             for j in 0..n_features {
                 let tmp = (largest_cov - cov[j]) / (aa - corr_eq_dir[j] + F::epsilon()); // TODO: check corr_eq_dir
-                let g1 = if g1 > tmp && tmp >= F::zero() { tmp } else { g1 };
+                if g1 > tmp && tmp >= F::zero() {
+                    g1 = tmp;
+                }
             }
 
-            let g2 = F::infinity();
+            // min-pos
+            let mut g2 = F::infinity();
             for j in 0..n_features {
                 let tmp = (largest_cov + cov[j]) / (aa + corr_eq_dir[j] + F::epsilon()); // TODO: check corr_eq_dir
-                let g2 = if g2 > tmp && tmp >= F::zero() { tmp } else { g2 };
+                if g2 > tmp && tmp >= F::zero() {
+                    g2 = tmp;
+                }
             }
             let gamma_ = <F as Float>::min(g1, <F as Float>::min(g2, largest_cov / aa));
 
@@ -232,20 +249,22 @@ fn lars<'a, F: 'static + Float + Lapack + Ord>(
                 std::mem::drop(prev_coef);
                 // resize the coefficients and alphas arrays
                 let add_features = 2 * usize::max(1, max_features - n_active);
-                let coefficients = coefficients.into_shape((n_iter + add_features, n_features))
-                                               .expect("coefficients have the correct shape");
+                let mut coefficients = coefficients
+                    .into_shape((n_iter + add_features, n_features))
+                    .expect("coefficients have the correct shape");
                 for i in add_features..n_iter + add_features {
                     for j in 0..n_features {
                         coefficients[[i, j]] = F::zero();
                     }
                 }
-                let mut alphas = alphas.into_shape(n_iter + add_features)
-                                   .expect("alphas have the correct shape");
+                let mut alphas = alphas
+                    .into_shape(n_iter + add_features)
+                    .expect("alphas have the correct shape");
                 for i in add_features..n_iter + add_features {
                     alphas[i] = F::zero();
                 }
             }
-            let coef = coefficients.slice(s![n_iter, ..]);
+            let mut coef = coefficients.slice(s![n_iter, ..]).to_owned();
             let prev_coef = coefficients.slice(s![n_iter - 1, ..]);
 
             // Making a forward step
@@ -260,10 +279,10 @@ fn lars<'a, F: 'static + Float + Lapack + Ord>(
         }
     }
     // Resize coefficients in case of early stopping
-    let alphas = alphas.slice(s![..n_iter + 1]);
-    let coefficients = coefficients.slice(s![..n_iter + 1, ..]);
-    
-    (alphas.view(), &active, coefficients.t().view())
+    let out_alphas = alphas.slice(s![..n_iter + 1]).to_owned();
+    let out_coefficients = coefficients.slice(s![..n_iter + 1, ..]).t().to_owned();
+
+    (out_alphas, active, out_coefficients)
 }
 
 fn swap_elements<F, I>(x: &mut ArrayBase<OwnedRepr<F>, I>, perm: (usize, usize), axis: usize)
